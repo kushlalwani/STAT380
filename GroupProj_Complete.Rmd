@@ -1,0 +1,637 @@
+---
+title: "GroupProject"
+author: "Rohan Gupta, Hanbyeol Lee, Kush Lalwani"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Front Matter
+```{r}
+
+# Importing required libraries
+library(FNN)
+library(randomForest)
+library(tidyverse)
+library(neuralnet)
+library(NeuralNetTools)
+
+# Importing data-sets
+CODGameModes <- read.csv("CODGameModes.csv")
+Player1 <- read.csv("CODGames_p1_380.csv")
+Player2 <- read.csv("CODGames_p2_380.csv")
+CODMaps <- read.csv("CODMaps.csv")
+```
+
+
+# Task 1: Data Cleaning and Data Visualization - Complete without Generative AI
+
+### RQ1: Which maps are the most likely to win the map vote when they are an option?
+
+
+As we approach the research question befroehand, We observed that there are a lot of missing values ('NA') in many columns: Map1, Map2, Confirms, Denies, Objectives, etc.
+We will have the adjustment with handling missing data and pre-processing.
+
+Our procedures were the following:
+
+1: Data Cleaning
+- Remove trailing spaces from map names in Map1, Map2, and Choice.
+- Identify and correct misspelled map names using the CODMaps reference file.
+
+2: Data Separation
+- Categorize games into three sections:
+- Games where maps are selected through voting.
+- Games where Map1 is selected due to a tie.
+- Games with no recorded map choice voting.
+
+3: Calculate Win Proportion
+- Count occurrences of each map in Map1 and Map2 as candidates.
+- Count occurrences of each map in Choice as winners.
+- Compute the proportion of wins for each map.
+
+4: Visualization
+- Visualize the win rates using a bar chart to identify the most likely maps to win
+
+```{r}
+# Combine Player1 and Player2 datasets
+Players <- bind_rows(Player1, Player2)
+
+# Data Cleaning: Remove trailing spaces and correct misspellings
+Players <- Players %>%
+  mutate(Map1 = trimws(Map1), 
+         Map2 = trimws(Map2), 
+         Choice = trimws(Choice))
+
+# Correct misspellings
+Players <- Players %>%
+  mutate(across(c(Map1, Map2, Choice), ~ case_when(
+    . == "Amrada Strike" ~ "Armada Strike",
+    . == "APocalypse" ~ "Apocalypse",
+    . == "Apocolypse" ~ "Apocalypse",
+    . == "Collateral Striek" ~ "Collateral Strike",
+    . == "Miami Stirke" ~ "Miami Strike",
+    TRUE ~ .
+  )))
+
+
+# Data Separation: Categorize by vote results
+Players <- Players %>%
+  mutate(
+    Vote1 = as.integer(ifelse(grepl("to", MapVote), strsplit(MapVote, " to ")[[1]][1], NA)),
+    Vote2 = as.integer(ifelse(grepl("to", MapVote), strsplit(MapVote, " to ")[[1]][2], NA)),
+    MapResult = case_when(
+      Vote1 == Vote2 ~ "Vote Draw",
+      Vote1 > Vote2 | Vote2 > Vote1 ~ "Vote Win",
+      TRUE ~ "No Vote"
+    )
+  )
+
+# Filter vote wins and draws
+vote_win <- Players %>% filter(MapResult == "Vote Win")
+vote_draw <- Players %>% filter(MapResult == "Vote Draw")
+
+# Count appearances for each map
+Map1_count1 <- vote_win %>% count(Map1)
+Map2_count1 <- vote_win %>% count(Map2)
+Choice_count1 <- vote_win %>% count(Choice)
+
+Map1_count2 <- vote_draw %>% count(Map1)
+Map2_count2 <- vote_draw %>% count(Map2)
+# Combine counts for wins
+V1a <- full_join(Map1_count1, Map2_count1, by = c("Map1" = "Map2")) %>%
+  rename(Name = Map1) %>%
+  mutate(
+    Map1 = replace_na(n.x, 0), # Count for Map1 in wins
+    Map2 = replace_na(n.y, 0), # Count for Map2 in wins
+    Choice = if_else(Name %in% Choice_count1$Choice, 
+                     Choice_count1$n[match(Name, Choice_count1$Choice)], 0) # Align Choice counts
+  ) %>%
+  select(Name, Map1, Map2, Choice)
+
+# Combine counts for draws
+V2a <- full_join(Map1_count2, Map2_count2, by = c("Map1" = "Map2")) %>%
+  rename(Name = Map1) %>%
+  mutate(
+    Map1 = replace_na(n.x, 0), # Count for Map1 in draws
+    Map2 = replace_na(n.y, 0)  # Count for Map2 in draws
+  ) %>%
+  select(Name, Map1, Map2)
+
+# Merge counts from wins and draws
+T1 <- full_join(V1a, V2a, by = "Name") %>%
+  mutate(
+    Map1 = replace_na(Map1.x, 0) + replace_na(Map1.y, 0),
+    Map2 = replace_na(Map2.x, 0) + replace_na(Map2.y, 0),
+    Choice = replace_na(Choice, 0)
+  ) %>%
+  select(Name, Map1, Map2, Choice) %>%
+  mutate(win_prop = Choice / (Map1 + Map2))
+
+# Sort by win proportion
+T1 <- T1 %>%
+  arrange(desc(win_prop))
+print(T1)
+
+
+# Visualization: Win Proportions
+ggplot(data = T1, mapping = aes(x = reorder(Name, -win_prop), y = win_prop, fill = Name)) +
+  geom_bar(stat = "identity", color = 'black') +
+  labs(
+    x = 'Maps',
+    y = 'Win Proportion',
+    title = 'Probability of Winning a Map Votes',
+    subtitle = 'Scenario: Including only cases with a winning or draw vote'
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(
+      angle = 90,        # Rotate labels vertically for better readability
+      hjust = 1,         # Adjust horizontal alignment
+      vjust = 0.5,       # Adjust vertical alignment
+      size = 8           # Reduce font size for labels
+    ),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5),
+    legend.position = "none"  # Remove the legend to declutter the plot
+  ) +
+  scale_y_continuous(limits = c(0, 1.1), expand = c(0, 0)) +
+  theme(plot.margin = ggplot2::margin(20, 20, 20, 20)) # Add margins for spacing
+
+
+```
+
+
+Through the observation of the bar chart, we concluded that `Nuketown '84` is the most likely map to win a vote, including scenarios of winning or drawing votes, with a win probability of 0.8205128. The second highest is `Crossroads Strike`, with a win probability of 0.7758621. Here we are ignoring the `Nuketown '84 Halloween` map, because as seen in the table, there was only one game played on it.
+
+
+
+# Task 2: Data Cleaning and Data Visualization - Complete using Generative AI
+
+```{r }
+# Combine datasets
+Players <- bind_rows(Player1, Player2)
+
+# Data Cleaning: Trim spaces and fix misspellings
+Players <- Players %>%
+  mutate(across(c(Map1, Map2, Choice), ~ trimws(.))) %>%
+  mutate(across(c(Map1, Map2, Choice), ~ case_when(
+    . == "Amrada Strike" ~ "Armada Strike",
+    . == "APocalypse" ~ "Apocalypse",
+    . == "Collateral Striek" ~ "Collateral Strike",
+    . == "Miami Stirke" ~ "Miami Strike",
+    TRUE ~ .
+  )))
+
+# Categorize games
+Players <- Players %>%
+  mutate(
+    Vote1 = as.integer(ifelse(str_detect(MapVote, "to"), str_split(MapVote, " to ")[[1]][1], NA)),
+    Vote2 = as.integer(ifelse(str_detect(MapVote, "to"), str_split(MapVote, " to ")[[1]][2], NA)),
+    MapResult = case_when(
+      Vote1 > Vote2 ~ "Vote Win",
+      Vote1 == Vote2 ~ "Vote Draw",
+      is.na(Vote1) & is.na(Vote2) ~ "No Vote",
+      TRUE ~ "Unknown"
+    )
+  )
+
+# Filter games based on MapResult
+vote_win <- Players %>% filter(MapResult == "Vote Win")
+vote_draw <- Players %>% filter(MapResult == "Vote Draw")
+
+# Count map appearances and wins
+candidate_counts <- Players %>%
+  select(Map1, Map2) %>%
+  pivot_longer(cols = c(Map1, Map2), names_to = "Position", values_to = "Map") %>%
+  group_by(Map) %>%
+  summarize(Total_Candidates = n(), .groups = "drop")
+
+win_counts <- Players %>%
+  group_by(Choice) %>%
+  summarize(Wins = n(), .groups = "drop") %>%
+  rename(Map = Choice)
+
+# Combine and calculate win proportions
+map_statistics <- candidate_counts %>%
+  left_join(win_counts, by = "Map") %>%
+  mutate(Wins = replace_na(Wins, 0),
+         Win_Proportion = Wins / Total_Candidates) %>%
+  arrange(desc(Win_Proportion))
+
+# Print table
+print(map_statistics)
+
+# Visualization
+ggplot(map_statistics, aes(x = reorder(Map, -Win_Proportion), y = Win_Proportion, fill = Map)) +
+  geom_bar(stat = "identity", color = "black") +
+  labs(
+    title = "Win Proportions of Maps",
+    x = "Maps",
+    y = "Win Proportion"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+```
+
+
+   Before I talk about the comparison, I have used ChatGPT-4o model and initial prompt were: 'Please help me clean a dataset containing map names for a voting game. The dataset contains columns with possible map candidates (Map1 and Map2) and a column for the winning map (Choice). Some map names have trailing spaces or misspellings. I also need to categorize the games into three sections: games where maps are selected through voting, games where Map1 is selected due to a tie, and games with no recorded map choice voting. Finally, calculate the win proportions for each map and visualize the results in a bar chart'. Also, I had the following follow-up prompt as well: 'Can you ensure the visualization has readable map names on the x-axis and sorted proportions in descending order? & 
+"Explain the logic for combining counts for wins and draws to calculate win proportions.'
+
+
+   My solution employs a highly detailed and methodical approach to address the research question. It explicitly handles data inconsistencies, such as mismatched rows between Map1, Map2, and Choice, ensuring that all maps are correctly aligned and counted. The use of full_join to merge datasets is deliberate and ensures no data is lost in the process. This thoroughness makes the my solution highly robust, especially for datasets with unexpected irregularities. However, the manual nature of these steps introduces verbosity, which increases the length and complexity of the code. While this is useful for clarity and debugging, it can also make the solution harder to maintain or adapt to future changes in the dataset.
+
+  On the other hand, the Generative AI solution prioritizes simplicity and efficiency by leveraging modern tidyverse functions like pivot_longer and mutate. These functions streamline the data cleaning and aggregation process, eliminating the need for repetitive joins and manual alignment of counts. By combining Map1 and Map2 into a single column, the AI solution simplifies the workflow and reduces the overall code length significantly. This approach is particularly advantageous for users who are familiar with tidyverse conventions and need to perform similar analyses on well-structured datasets. However, the AI solution assumes the dataset has a predictable structure, which may result in errors or oversights if unexpected inconsistencies arise.
+
+  The visualization on my solution is effective but requires additional adjustments to improve readability. The default horizontal x-axis labels and inclusion of a legend make the chart cluttered and harder to interpret. While these issues are addressed in later steps, the process requires manual intervention. In contrast, the Generative AI solution produces a more polished visualization by default. It rotates the x-axis labels vertically, reduces font sizes for better spacing, and removes unnecessary elements like the legend. The minimalistic approach used by the AI makes the visualization more readable and visually appealing with minimal effort, highlighting its strength in optimizing default settings.
+
+  In conclusion, my solution is best suited for scenarios that require robustness and careful handling of potential edge cases. Its detailed steps ensure that every aspect of the data is accounted for, making it reliable for datasets with inconsistencies or complexities. However, the Generative AI solution shines in scenarios where efficiency and simplicity are prioritized. Its streamlined approach and clean visualization setup make it ideal for quick prototyping or routine data analysis. Aggregating each feaures of the solution, I believe my solution is  better for educational or complex datasets, while the Generative AI solution excels in time-sensitive and straightforward applications.
+
+
+# Task 3: Inference
+
+#### For this task we are comparing how the GameType variable affects the TotalXP after accounting for the Score.
+
+Here we are giving two different data-sets for two different players, so we should combine them in a variable that allows us to compute on both of their data together, while also leaving us with the liberty to work on them individually.
+```{r}
+# Combine the two datasets into one
+Players <- bind_rows(Player1, Player2)
+```
+
+
+Before we start to answer this question, we must understand if the GameType affects the XPType at all. This is done because if GameType does not affect the XPType we would want to find the TotalXP before the XPType boost has been applied to it, but if the GameType does affect the XPType then we would not want to do that.
+
+
+For this we would be using the Chi Test as suggest by chatGPT after the prompt:
+
+"In R how to see if one categorical variable affects another categorical variable" 
+
+
+```{r}
+
+
+# Clean the GameType column and store in new GameMode Variable
+Players$GameMode <- gsub("HC - ", "", Players$GameType)
+
+# Using Chi Test
+
+contingency_table <- table(Players$GameMode, Players$XPType)
+chi_test <- chisq.test(contingency_table)
+print(chi_test)
+
+```
+
+
+Here we get the p-value of 0.8964.
+
+This suggest that there is significant relation between GameType and XPType, thus for the future calculations it would be better if we create a new variable that records the TotalXP, without the XPType boosts, but also use the original TotalXP variable.
+
+
+
+```{r}
+
+# Creating a new variable XP that records the TotalXP before the applied boosts
+Players <- Players |>
+  mutate(
+    XP = case_when(
+      XPType == "10% Boost" ~ TotalXP / 1.1,
+      XPType == "Double XP + 10%" ~ TotalXP / 2.2,
+      TRUE ~ TotalXP
+    )
+  )
+
+
+```
+
+
+Next, we will analyse the distribution of XP and TotalXP seperately
+
+```{r}
+
+# Visualization of TotalXP
+ggplot(Players, aes(x = TotalXP)) + 
+  geom_histogram(bin = 30, fill="green", color="black") +
+  labs(title="Distribution of TotalXP", x="TotalXP", y="Frequency")
+
+# Visualization of XP
+ggplot(Players, aes(x = XP)) + 
+  geom_histogram(bin = 30, fill="red", color="black") +
+  labs(title="Distribution of XP", x="XP", y="Frequency")
+
+
+```
+
+Now, lets analyse the ralation between XP/TotalXP and Score
+
+```{r, out.width='100%'}
+
+# First with TotalXP
+
+# Linear Regression Graph
+ggplot(Players, aes(x = Score, y = TotalXP, color = GameMode)) +
+  geom_boxplot() +
+  labs(title ="TotalXP vs Score by GameType", x="Score", y="TotalXP")
+
+# First with XP
+ggplot(Players, aes(x = Score, y = XP, color = GameMode)) + 
+  geom_boxplot() +
+  labs(title ="XP vs Score by GameType", x="Score", y="XP")
+```
+
+
+Finally the lm:
+
+```{r}
+
+TotalXP_model <- lm(TotalXP ~ Score + GameMode, data=Players)
+XP_model <- lm(XP ~ Score + GameMode, data=Players)
+
+
+summary(TotalXP_model)
+summary(XP_model)
+
+```
+
+### TotalXP Model
+
+The TotalXp model indicates that both Score and GameType significantly influence TotalXP. Score has a strong positive effect, where each unit increase in Score adds approximately 2.85 to TotalXP. Regarding GameType, players in "TDM" earn significantly less TotalXP compared to reference GameType, with an average reduction of 4561.4 points, even after accounting for their Score. However, the effects of "Hardpoint" and "Kill Confirmed" on TotalXp are not statistically significant. This model explains around 36 percent of variability in TotalXP, suggesting that other factors beyond Score and GameType may also play a role in determining TotalXP.
+
+
+### Xp Model
+
+The XP model provides further insights, showing that Score remains a strong predictor, with each unit increase in Score resulting in 1.39 increase in XP. For GameTYpe, players in "Hardpoint" earn significantly more XP compared to the reference GameType (An increase of 1283.6 on average), while "TDM" and "Kill Confirm" show no statistically significant differences. With an adjusted R square of 0.51, this model captures more variability in XP compared to the TotalXP model, suggesting it better explains the relationship between Score, GameType and XP.
+
+
+
+
+# Task 4: Prediction
+
+### Research Question: Can We Predict Which Weapon a Player is Using Variables in the Dataset?
+
+First we will need to decide which variables would be relevant in predicting the primary weapon used by the player in the game. Variables like `Eliminations`, `Deaths`, and `Damage` are obviously going to be related to what weapon the player used. 
+
+There are also some variables that may not be as obvious that could affect the primary weapon choice. 
+
+One example is the `Choice` Variable, this variable shows which map the players voted to play the game on; this variable could make a difference to the player's weapon choice as some might vary in size. From my previous knowledge of Call of Duty games, I know that smaller maps, like Nuketown, more players choose to use weapons for shorter range (like SMGs or Shotguns). For maps that are bigger, such as Moscow, players will choose to use longer range weapons (like Snipers or ARs).
+
+Another Variable that might not be thought of initially is the `GameType` variable. This column contain entries about the game mode of the observation. Sometimes entries can contain the prefix "HC", this means that the player was playing a 'HardCore' mode as compared with the traditional 'Core' game modes. In a HardCore game, all players health points (HP) are significantly lower (about 30 HP in HardCore, and 100 HP in Core). This means that players playing HardCore modes may not use weapons that do much damage as there is a lower amount of damage required to earn an elimination.
+
+#### Creating the dataset used for classification
+
+We shouldn't use observations where the player only played the partial, this is because it could skew our predictions. For example if a player didn't play a full game, their damage will likely be lower than a player that played a full game. For this reason, we will get rid of observations where only a partial game was played. We will also only use the observations where the `PrimaryWeapon` column is not empty.
+
+```{r}
+WeaponDF <- 
+  Players |>
+  filter(FullPartial == "Full") |>
+  filter(PrimaryWeapon != "") |>
+  select(PrimaryWeapon, Eliminations, Deaths, Damage, Choice, GameType)
+```
+
+Now we will need to create a couple new variables to do our classification: 
+First, we will create the Elimination to Death ratio variable, which will standardize the performance of the player to a simple ratio.
+Next, we will create an indicator variable for if the player was playing a HardCore game mode or not.
+```{r}
+WeaponDF <- 
+  WeaponDF |>
+  mutate(EDR = Eliminations / ifelse(Deaths == 0, 1, Deaths), # ensures we do not divide by 0, 
+         HC = ifelse(grepl("HC -", GameType), 1, 0)) |>
+  select(PrimaryWeapon,EDR, HC, Damage, Choice)
+  
+
+#Clean the PrimaryWeapon column
+WeaponDF <- 
+  WeaponDF |>
+  mutate(PrimaryWeapon = trimws(PrimaryWeapon), #some weapon names have whitespace around them
+         PrimaryWeapon = case_when(PrimaryWeapon == "Milano" ~ "Milano 821", #these weapons have multiple names in the dataset
+                                   PrimaryWeapon %in% c("Pellington", "Pellington 703", "Pelington 703") ~ "Pellington 703",
+                                   TRUE ~ PrimaryWeapon))
+```
+
+#### Perform a Training/Validation Split to use for all the classification models
+```{r}
+#Perform an 80/20 training/validation split
+set.seed(123456789)
+trainInd <- sample(1:nrow(WeaponDF), floor(0.8 * nrow(WeaponDF)))
+set.seed(NULL)
+
+TrainWeapon <- WeaponDF[trainInd, ]
+ValidationWeapon <- WeaponDF[-trainInd, ]
+```
+
+### Random Forest Classification
+Random Forest is a machine learning algorithm that combines multiple decision trees to make predictions. It works as follows:
+
+Building Trees: 
+  The algorithm creates many decision trees during training. Each tree is built using a random subset of the data (called bootstrapping) and considers a random subset of features at each decision point (split).
+
+Making Predictions:
+
+ 1. For classification tasks, each tree votes for a class, and the most voted class becomes the final prediction.
+ 2. For regression tasks, the final prediction is the average of the predictions from all trees.
+ 
+Key Strengths:
+
+ 1. Accuracy: By averaging the results of multiple trees, Random Forest reduces the risk of overfitting compared to a single decision tree.
+ 2. Robustness: It performs well even when some data is noisy or missing.
+ 3. Feature Importance: It helps identify which features are most important for making predictions.
+
+```{r}
+set.seed(594)
+# building the RF model
+rfModel <- randomForest(as.factor(PrimaryWeapon) ~ .,
+                        data = TrainWeapon, 
+                        ntree = 500, 
+                        mtry = 2, # Use 2 because for classification, we should use sqrt(numFeatures)
+                        importance = TRUE)
+
+set.seed(NULL)
+#Display the Variable Importance
+rfModel$importance
+
+```
+
+```{r}
+#Find the importance of variables
+varImpPlot(rfModel, n.var = 4)
+```
+
+According to the decrease in accuracy, `Damage` and `HC` were the most importance variables. However, according to the decrease in Gini index, `Damage` and `EDR` where the two most important variables.
+
+```{r}
+predWeapon <- predict(rfModel, newdata= ValidationWeapon, type = "response") 
+  
+#Create confusion matrix
+table(predWeapon, ValidationWeapon$PrimaryWeapon)
+
+#Calculate accuracy
+mean(predWeapon == ValidationWeapon$PrimaryWeapon)
+```
+
+As we can see the accuracy for the random forest model is very low, at about 10.2%. Hopefully, the other methods will provide a better accuracy rate.
+
+### kNN Classification
+
+k-Nearest Neighbors (kNN) is a simple and intuitive machine learning algorithm used for classification. It works by identifying the k closest data points (neighbors) to a given input based on a distance metric (e.g., Euclidean distance). The input is then classified by the majority class among these neighbors. kNN is non-parametric, meaning it makes no assumptions about the data distribution, and its performance depends on the choice of k and the distance metric.
+
+We will use a plot to quickly visualize the data. We learned that `Damage` and `EDR` were two of the most important variables according to the decrease in the Gini index
+```{r}
+ggplot(data = WeaponDF, mapping = aes(x = Damage,
+                                   y = EDR,
+                                   color = PrimaryWeapon)) +
+  geom_point() +
+  labs(x = "Damage",
+       y = "Elimination to Death Ratio",
+       color = "Weapon")
+```
+
+We see that there are different colored points scattered all over the plot. This shows it might be difficult to classify the variables based on their nearest neighbors.
+NOTE. We can't use the `Choice` variable because it is not numeric, so there is no way to compute the distance.
+
+```{r}
+#Find the ideal value of k for kNN Classification
+
+xvars <- c("EDR","HC","Damage")
+scaledTrain <- TrainWeapon
+scaledVal <- ValidationWeapon
+
+#Scale the Data
+scaledTrain[,xvars] <- scale(TrainWeapon[,xvars], center = TRUE, scale = TRUE)
+scaledVal[,xvars] <- scale(ValidationWeapon[,xvars], center = TRUE, scale = TRUE)
+
+#Set up for loop
+maxK <- 100
+acc_vec <- rep(NA, maxK)
+
+
+
+#Loop through values for NN
+for(i in 1:maxK){
+  #Build model
+  knn_res <- knn(train = scaledTrain[ , xvars, drop = FALSE],
+                 test = scaledVal[ , xvars, drop = FALSE],
+                 cl = scaledTrain$PrimaryWeapon,
+                 k = i)
+  
+  scaledVal <- scaledVal %>% mutate(pred_weap = knn_res)
+  
+  #Find and store accuracy
+  acc_vec[i] <- mean(scaledVal$pred_weap == scaledVal$PrimaryWeapon)
+}
+```
+
+Now we will show the plot to find the highest accuracy
+```{r}
+#Create Plot
+temp_df <- data.frame(k = 1:maxK, accuracy = acc_vec)
+
+ggplot(data = temp_df, mapping = aes(x = k, y = accuracy)) +
+  geom_line() +
+  labs(x = "Number of Nearest Neighbors",
+       y = "Accuracy") +
+  geom_point(data = temp_df[which.max(acc_vec), ], 
+             color = "red", 
+             size = 3,
+             shape = 1)
+
+```
+
+Display the value of k associated with the highest accuracy
+```{r}
+max(temp_df$accuracy)
+which.max(temp_df$accuracy)
+```
+
+The highest accuracy is about 20.5% associated with the k value of 71.
+
+As we can see the kNN classification model works significantly better than the random forest model.
+
+### Neural Network
+
+Neural Network Classification is a machine learning technique inspired by the human brain. It uses layers of interconnected nodes (neurons) to process input data and learn complex patterns. Each connection has a weight, which is adjusted during training to minimize the error between predicted and actual outputs. Neural networks are particularly effective for classification tasks involving large datasets or non-linear relationships, with each layer progressively extracting higher-level features from the input.
+
+I learned how to implement Neural Network using R in MATH/STAT 415
+
+I used ChatGPT to determine how many layers I should have and the amount of nodes in each layer
+Prompt: "how many layers and how any layers in each for classifying a variable with 21 levels and four predictor variables?"
+
+We also cannot use the `Choice` variable here because neural networks can only take on numeric values.
+
+```{r}
+set.seed(61711)
+
+neuralRes <- neuralnet(as.factor(PrimaryWeapon) ~ . -Choice ,
+                       data = TrainWeapon,
+                       hidden = c(5),
+                       linear.output = FALSE)
+
+set.seed(NULL)
+```
+
+Display a plot of the network
+```{r, eval = FALSE}
+plotnet(neuralRes,node.width = 0.01, node.height = 0.01, cex = 0.5, layout = "tree")
+```
+```{r,echo=FALSE}
+knitr::include_graphics("neuralnet.jpeg") #error with knitting with the plot function
+```
+
+
+A neural network plot shows the structure of the network, including:
+
+-Input Layer: Receives the input data (features). (nodes labeled I)
+
+-Hidden Layers: Process data using weights and activation functions. (nodes labeled H)
+
+-Output Layer: Produces the final prediction. (nodes labeled O)
+
+-Bias Nodes: Provide flexibility by adding a constant value to the neuron’s weighted sum, helping the model shift the activation function. (nodes labeled B)
+
+-Connections (Weights): Represent relationships between neurons, the black lines mean positive weight and the grey lines show negative weight.
+
+-Flow Direction: Data flows from input -> hidden layers -> output.
+
+-Bias nodes and weights enable the network to learn and adjust predictions more accurately.
+
+
+Now we will calculate the model accuracy
+```{r}
+actualWeapon <- as.factor(ValidationWeapon$PrimaryWeapon)
+
+predictions <- predict(neuralRes, ValidationWeapon)
+colnames(predictions) <- levels(as.factor(TrainWeapon$PrimaryWeapon)) #set column names of the prediction matrix to the weapon names
+
+predicted_classes <- colnames(predictions)[apply(predictions, 1, which.max)] #extract the predicted class labels
+predicted_classes <- factor(predicted_classes, levels = levels(as.factor(ValidationWeapon$PrimaryWeapon))) #convert predictions to factor
+
+mean(predicted_classes == actualWeapon)
+
+```
+
+According to our neural network classification model, the accuracy was about 15%. This means that our model could correctly calculate the correct weapon 15% of the time.
+
+
+### Final Thoughts
+
+Looking at all three of the classification methods used, I choose kNN classification as the best one to use in this scenario. It is the model that resulted in the highest accuracy of classifying the weapon that the player used in the game. From kNN, we got an accuracy of about 20.5%; while it is the highest we found, it is most certainly not very accurate. 
+
+In second place is the Neural Network Classification. This model provided an accuracy of about 15%.
+
+In last place is the random forest model which could predict the weapon used correctly just 10.2% of the time.
+
+Looking back on it, this research question was probably a bit too complicated for these methods to compute, as it always resulted in a relatively low accuracy. If I were to do this again, I would choose to predict a variable with less levels, as it could make the model's accuracy a lot higher.
+
+
+
+
+
+
+
